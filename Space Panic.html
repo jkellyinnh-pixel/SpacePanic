@@ -189,7 +189,7 @@ function addScore(n, x, y) {
 function burst(px, py, col, n) {
   for (let i = 0; i < n; i++) particles.push({ x: px, y: py, vx: rnd(-70, 70), vy: rnd(-110, 20), l: rnd(0.4, 0.9), c: col });
 }
-function newPlayer() { return { x: 14.5, f: 3, y: SR[3], climb: false, g: 0, dir: 1, anim: 0, lock: 0, q: 0, dead: false }; }
+function newPlayer() { return { x: 14.5, f: 3, y: SR[3], climb: false, g: 0, dir: 1, anim: 0, lock: 0, q: 0, fall: false, ft: 0, col: 0, dead: false }; }
 function playerFloor() { return player.climb ? Math.round((player.y - SR[0]) / 5) : player.f; }
 
 /* ---------- levels ---------- */
@@ -238,10 +238,25 @@ function ladderNear(x, gap) {
   for (let i = 0; i < cols.length; i++) if (Math.abs(x - (cols[i] + 0.5)) < 0.45) return cols[i];
   return -1;
 }
+function startPlayerFall(p, c) {
+  p.x = c + 0.5; p.col = c; p.ft = 0; p.fall = true; p.lock = 0; p.q = 0;
+}
+function updPlayerFall(dt) {
+  const p = player;
+  p.ft += dt;
+  const k = Math.min(1, p.ft / FALL_TIME);
+  p.y = SR[p.f] + (SR[p.f + 1] - SR[p.f]) * k * k;
+  if (p.ft < FALL_TIME) return;
+  p.f++; p.y = SR[p.f]; p.ft = 0;
+  const below = p.f < GROUND ? openHole(p.f, p.col) : null;
+  if (below) return;
+  p.fall = false;
+}
 
 /* ---------- player ---------- */
 function updPlayer(dt) {
   const p = player; p.anim += dt;
+  if (p.fall) { updPlayerFall(dt); return; }
   if (p.lock > 0) {
     p.lock -= dt;
     if (p.lock <= 0) { p.lock = 0; if (p.q) { const d = p.q; p.q = 0; actDig(d); } }
@@ -256,7 +271,11 @@ function updPlayer(dt) {
       }
     }
     const dx = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
-    if (!p.climb && dx) { p.dir = dx; stepX(p, dx * PS * dt, true); }
+    if (!p.climb && dx) { p.dir = dx; stepX(p, dx * PS * dt, false); }
+    if (!p.climb) {
+      const c = Math.floor(p.x);
+      if (openHole(p.f, c) && Math.abs(p.x - (c + 0.5)) < 0.35) startPlayerFall(p, c);
+    }
   }
   if (p.climb) {
     const dy = (keys.down ? 1 : 0) - (keys.up ? 1 : 0);
@@ -268,7 +287,7 @@ function updPlayer(dt) {
 function actDig(dir) {
   if (state !== 'play' || paused) return;
   const p = player;
-  if (p.climb) return;
+  if (p.climb || p.fall) return;
   if (p.lock > 0) { p.q = dir; return; }   // buffer one tap so fast tapping still counts
   const c = Math.floor(p.x), dc = c + dir, f = p.f;
   p.dir = dir;
