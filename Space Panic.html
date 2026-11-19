@@ -1,0 +1,628 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>Space Panic</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Inter:wght@400;600&display=swap">
+<style>
+/* Layout: one centered square arcade cabinet screen, a quiet header above it, key legend and touch pad below. Single dark look, committed on purpose. */
+:root {
+  --bg: #07081a;
+  --panel: #0f1130;
+  --line: #2a2d63;
+  --ink: #e9ecff;
+  --dim: #8f95c9;
+  --girder: #ff6a4a;
+  --ladder: #3fe0ff;
+  --accent: #ffd23f;
+  --display: 'Press Start 2P', 'Courier New', monospace;
+  --body: Inter, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  color-scheme: dark;
+}
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--body);
+  padding-block: 16px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.wrap { max-width: 600px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+.top { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+h1 { margin: 0; font: 400 15px/1.3 var(--display); letter-spacing: .04em; color: var(--accent); text-wrap: balance; }
+.btn-sound {
+  font: 600 12px/1 var(--body); letter-spacing: .06em; text-transform: uppercase;
+  color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  padding: 9px 12px; cursor: pointer;
+}
+.btn-sound:hover { border-color: var(--dim); }
+.btn-sound:focus-visible, .pad button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+canvas {
+  display: block; width: 100%; height: auto; aspect-ratio: 1 / 1;
+  image-rendering: pixelated; background: #07081a;
+  border: 1px solid var(--line); border-radius: 4px; touch-action: none;
+}
+.keys { margin: 0; color: var(--dim); font-size: 13px; line-height: 1.6; max-width: 65ch; }
+.keys kbd {
+  font: 600 11px/1 var(--body); color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 4px; padding: 2px 6px;
+}
+.pad { display: none; grid-template-columns: repeat(3, 1fr); gap: 8px; user-select: none; -webkit-user-select: none; }
+.pad button {
+  min-height: 56px; font: 600 14px/1 var(--body); color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 8px; touch-action: none;
+}
+.pad button.dig { color: var(--accent); }
+.pad button:active, .pad button.on { background: var(--line); }
+@media (pointer: coarse) { .pad { display: grid; } }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto; } }
+</style>
+
+<main class="wrap">
+  <div class="top">
+    <h1>Space Panic</h1>
+    <button class="btn-sound" id="sound" type="button">Sound on</button>
+  </div>
+  <canvas id="game" aria-label="Space Panic arcade game"></canvas>
+  <p class="keys"><kbd>←</kbd> <kbd>→</kbd> walk · <kbd>↑</kbd> <kbd>↓</kbd> climb a ladder · <kbd>Z</kbd> dig left · <kbd>X</kbd> dig right. Tap a dig key three times to finish a hole. Three taps toward an open hole refill it, or knock a trapped alien through the floor. Every alien dies when it falls one floor. Dig holes directly under one another so it keeps falling, and you earn a random bonus for each extra floor. <kbd>P</kbd> pause · <kbd>M</kbd> sound.</p>
+  <div class="pad" id="pad">
+    <button type="button" class="dig" data-act="digL">Dig left</button>
+    <button type="button" data-k="up">▲</button>
+    <button type="button" class="dig" data-act="digR">Dig right</button>
+    <button type="button" data-k="left">◀</button>
+    <button type="button" data-k="down">▼</button>
+    <button type="button" data-k="right">▶</button>
+  </div>
+</main>
+
+<script>
+(() => {
+'use strict';
+
+/* ---------- constants ---------- */
+const COLS = 28, ROWS = 28, T = 16, W = COLS * T, H = ROWS * T;
+const SR = [5, 10, 15, 20, 25];          // standing row of each floor (0 = top, 4 = ground)
+const GROUND = 4;
+const LAD = [[4, 16, 24], [8, 20], [3, 13, 25], [10, 22]]; // ladder columns in the gap below floor k
+const SCOOPS = 3, SCOOP_TIME = 0.16, HOLE_LIFE = 12, FALL_TIME = 0.34;
+const PS = 4.6, CS = 3.6;                // player walk / climb speed, tiles per second
+const BONUS = [500, 1000, 1500, 2000];   // random pick, multiplied by each extra floor fallen
+const KINDS = {
+  red:   { sp: 2.0, trap: 4.2, smart: 0.55 },
+  blue:  { sp: 2.5, trap: 3.4, smart: 0.75 },
+  green: { sp: 3.0, trap: 2.8, smart: 0.90 }
+};
+
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+ctx.imageSmoothingEnabled = false;
+try { document.fonts && document.fonts.load("8px 'Press Start 2P'"); } catch (e) {}
+
+/* ---------- original pixel art ---------- */
+const PAL = {
+  h: '#f2f5ff', v: '#37d4ff', b: '#d7deef', o: '#ff9b2f', s: '#8b9cc4', l: '#5b6fa8',
+  r: '#ff5252', d: '#9c1c32', w: '#ffffff', k: '#10101c',
+  c: '#4aa8ff', D: '#1d4ea8', g: '#5dff85', G: '#1d8a40'
+};
+const SRC = {
+  pA: ["....hhhh....", "...hhhhhh...", "..hhhvvvvh..", "..hhhvvvvh..", "...hhhhhh...", "..obbbbbbb..", ".oobbbbbbs..", "..obbbbbbs..", "...bb..bb...", "...bb..bb...", "..lll..lll..", "............"],
+  pB: ["....hhhh....", "...hhhhhh...", "..hhhvvvvh..", "..hhhvvvvh..", "...hhhhhh...", "..obbbbbbb..", ".oobbbbbbs..", "..obbbbbbs..", "....bbbb....", "....bbbb....", "...llllll...", "............"],
+  pC: ["....hhhh....", "...hhhhhh...", "..hhhhhhhh..", "..hhhhhhhh..", "...hhhhhh...", ".bb.bbbb.bb.", ".b..bbbb..b.", "...oobboo...", "...bb..bb...", "...bb..bb...", "..lll..lll..", "............"],
+  rA: ["..r......r..", "...r....r...", "..rrrrrrrr..", ".rrrrrrrrrr.", ".rrwwrrwwrr.", ".rrwkrrwkrr.", ".rrrrrrrrrr.", ".rrrddddrrr.", "..rrrrrrrr..", "..rr....rr..", ".rr......rr.", "............"],
+  rB: ["..r......r..", "...r....r...", "..rrrrrrrr..", ".rrrrrrrrrr.", ".rrwwrrwwrr.", ".rrwkrrwkrr.", ".rrrrrrrrrr.", ".rrrddddrrr.", "..rrrrrrrr..", "...rr..rr...", "..rr....rr..", "............"],
+  bA: ["c..........c", ".c........c.", "..cccccccc..", ".cccccccccc.", ".cwwccccwwc.", ".cwkccccwkc.", ".cccccccccc.", ".cccDDDDccc.", "..cccccccc..", "..cc.cc.cc..", ".cc......cc.", "............"],
+  bB: ["c..........c", ".c........c.", "..cccccccc..", ".cccccccccc.", ".cwwccccwwc.", ".cwkccccwkc.", ".cccccccccc.", ".cccDDDDccc.", "..cccccccc..", "...c.cc.c...", "..cc....cc..", "............"],
+  gA: ["....gggg....", "..gggggggg..", ".gggggggggg.", ".gggwwwwggg.", ".gggwkkwggg.", ".gggwwwwggg.", ".gggggggggg.", ".ggGGGGGGgg.", "..gggggggg..", "..g.g..g.g..", ".g..g..g..g.", "............"],
+  gB: ["....gggg....", "..gggggggg..", ".gggggggggg.", ".gggwwwwggg.", ".gggwkkwggg.", ".gggwwwwggg.", ".gggggggggg.", ".ggGGGGGGgg.", "..gggggggg..", "...g.gg.g...", "..g..gg..g..", "............"]
+};
+function mk(rows) {
+  const c = document.createElement('canvas'); c.width = 12; c.height = 12;
+  const x = c.getContext('2d');
+  rows.forEach((r, j) => { for (let i = 0; i < 12; i++) { const ch = r[i]; if (ch !== '.') { x.fillStyle = PAL[ch]; x.fillRect(i, j, 1, 1); } } });
+  return c;
+}
+const SPR = {};
+Object.keys(SRC).forEach(k => { SPR[k] = mk(SRC[k]); });
+
+function tileCanvas(draw) { const c = document.createElement('canvas'); c.width = T; c.height = T; draw(c.getContext('2d')); return c; }
+const GIRDER = tileCanvas(g => {
+  g.fillStyle = '#d8452f'; g.fillRect(0, 0, 16, 16);
+  g.fillStyle = '#ff8a63'; g.fillRect(0, 0, 16, 2);
+  g.fillStyle = '#8d2418'; g.fillRect(0, 14, 16, 2);
+  g.fillStyle = '#b53420';
+  for (let i = 0; i < 10; i++) { g.fillRect(3 + i, 3 + i, 1, 1); g.fillRect(12 - i, 3 + i, 1, 1); }
+  g.fillStyle = '#ffd1b0'; g.fillRect(1, 7, 1, 1); g.fillRect(14, 7, 1, 1);
+});
+const GROUNDT = tileCanvas(g => {
+  g.fillStyle = '#2d2a63'; g.fillRect(0, 0, 16, 16);
+  g.fillStyle = '#5a56c0'; g.fillRect(0, 0, 16, 2);
+  g.fillStyle = '#1b1946'; g.fillRect(0, 14, 16, 2);
+  g.fillStyle = '#3b378a'; g.fillRect(4, 6, 8, 1); g.fillRect(2, 10, 5, 1); g.fillRect(9, 10, 5, 1);
+});
+const stars = Array.from({ length: 70 }, (_, i) => ({ x: (i * 97) % W, y: (i * 61) % (H - 20), s: i % 7 === 0 ? 2 : 1, p: i * 1.3 }));
+
+/* ---------- state ---------- */
+let state = 'title', paused = false, t = 0;
+let score = 0, hi = 0, lives = 3, level = 1;
+let oxygen = 60, oxMax = 60;
+let player, aliens = [], spawnQ = [], spawnT = 0, spawnSide = 0;
+let particles = [], popups = [];
+let bannerT = 0, stateT = 0, clearBonus = 0, deathCause = '';
+const holes = new Map();
+const keys = { left: false, right: false, up: false, down: false };
+try { hi = parseInt(localStorage.getItem('spacepanic-hi') || '0', 10) || 0; } catch (e) {}
+
+/* ---------- sound ---------- */
+let ac = null, muted = false;
+function beep(f, d, type, v, slide) {
+  if (muted) return;
+  try {
+    ac = ac || new (window.AudioContext || window.webkitAudioContext)();
+    const o = ac.createOscillator(), g = ac.createGain(), n = ac.currentTime;
+    o.type = type || 'square'; o.frequency.setValueAtTime(f, n);
+    if (slide) o.frequency.linearRampToValueAtTime(Math.max(30, f + slide), n + d);
+    g.gain.setValueAtTime(v || 0.04, n); g.gain.linearRampToValueAtTime(0.0001, n + d);
+    o.connect(g); g.connect(ac.destination); o.start(n); o.stop(n + d);
+  } catch (e) {}
+}
+const sfx = {
+  dig: () => beep(140, 0.12, 'square', 0.05, -40),
+  fill: () => beep(220, 0.08, 'square', 0.04),
+  trap: () => beep(520, 0.1, 'triangle', 0.06, -250),
+  kill: () => { beep(600, 0.28, 'square', 0.05, -520); },
+  crush: () => beep(300, 0.2, 'sawtooth', 0.04, -200),
+  die: () => beep(440, 0.9, 'sawtooth', 0.06, -400),
+  clear: () => { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => beep(f, 0.14, 'square', 0.05), i * 110)); },
+  bonus: () => { [784, 988, 1175, 1568].forEach((f, i) => setTimeout(() => beep(f, 0.1, 'square', 0.04), i * 70)); },
+  tick: () => beep(900, 0.04, 'square', 0.03)
+};
+
+/* ---------- helpers ---------- */
+const rnd = (a, b) => a + Math.random() * (b - a);
+const isOpening = (f, c) => f < GROUND && LAD[f].indexOf(c) >= 0;
+const holeAt = (f, c) => holes.get(f * COLS + c);
+const openHole = (f, c) => { const h = holeAt(f, c); return h && h.depth >= SCOOPS ? h : null; };
+function canDig(f, c) { return f < GROUND && c >= 0 && c < COLS && !isOpening(f, c) && !holeAt(f, c); }
+function addScore(n, x, y) {
+  score += n; if (score > hi) hi = score;
+  popups.push({ x, y, s: String(n), l: 1.1 });
+}
+function burst(px, py, col, n) {
+  for (let i = 0; i < n; i++) particles.push({ x: px, y: py, vx: rnd(-70, 70), vy: rnd(-110, 20), l: rnd(0.4, 0.9), c: col });
+}
+function newPlayer() { return { x: 14.5, f: 3, y: SR[3], climb: false, g: 0, dir: 1, anim: 0, lock: 0, q: 0, dead: false }; }
+function playerFloor() { return player.climb ? Math.round((player.y - SR[0]) / 5) : player.f; }
+
+/* ---------- levels ---------- */
+function buildQueue(l) {
+  const total = Math.min(10, 3 + l), q = [];
+  for (let i = 0; i < total; i++) {
+    let k = 'red';
+    if (l >= 2) { const r = Math.random(); k = l >= 3 ? (r < 0.4 ? 'red' : r < 0.75 ? 'blue' : 'green') : (r < 0.6 ? 'red' : 'blue'); }
+    if (l >= 6 && k === 'red' && Math.random() < 0.5) k = 'blue';
+    q.push(k);
+  }
+  return q;
+}
+function startLevel(l) {
+  level = l; state = 'play'; stateT = 0; bannerT = 1.6;
+  oxMax = Math.max(40, 70 - 4 * (l - 1)); oxygen = oxMax;
+  holes.clear(); aliens = []; particles = []; popups = [];
+  player = newPlayer(); spawnQ = buildQueue(l); spawnT = 1.6;
+}
+function startGame() { score = 0; lives = 3; startLevel(1); beep(660, 0.1, 'square', 0.05); }
+function resetRound() {
+  const left = aliens.filter(a => a.st !== 'gone').map(a => a.kind).concat(spawnQ);
+  spawnQ = left; aliens = []; holes.clear(); particles = []; popups = [];
+  player = newPlayer(); oxygen = oxMax; spawnT = 1.6; state = 'play'; bannerT = 1.0;
+}
+function die(cause) {
+  if (state !== 'play') return;
+  state = 'dead'; stateT = 0; player.dead = true; deathCause = cause;
+  burst(player.x * T, (player.y + 0.5) * T, '#f2f5ff', 22);
+  sfx.die();
+}
+function saveHi() { try { localStorage.setItem('spacepanic-hi', String(hi)); } catch (e) {} }
+
+/* ---------- movement ---------- */
+function stepX(e, dx, blockHoles) {
+  let nx = Math.max(0.5, Math.min(COLS - 0.5, e.x + dx));
+  if (blockHoles) {
+    const dir = Math.sign(dx), hw = 0.3;
+    const ec = Math.floor(nx + dir * hw), cc = Math.floor(e.x + dir * hw);
+    if (ec !== cc && openHole(e.f, ec)) return false;
+  }
+  e.x = nx; return true;
+}
+function ladderNear(x, gap) {
+  const cols = LAD[gap];
+  for (let i = 0; i < cols.length; i++) if (Math.abs(x - (cols[i] + 0.5)) < 0.45) return cols[i];
+  return -1;
+}
+
+/* ---------- player ---------- */
+function updPlayer(dt) {
+  const p = player; p.anim += dt;
+  if (p.lock > 0) {
+    p.lock -= dt;
+    if (p.lock <= 0) { p.lock = 0; if (p.q) { const d = p.q; p.q = 0; actDig(d); } }
+    return;
+  }
+  if (!p.climb) {
+    if (keys.up || keys.down) {
+      const gap = keys.up ? p.f - 1 : p.f;
+      if (gap >= 0 && gap < GROUND) {
+        const c = ladderNear(p.x, gap);
+        if (c >= 0) { p.climb = true; p.g = gap; p.x = c + 0.5; }
+      }
+    }
+    const dx = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+    if (!p.climb && dx) { p.dir = dx; stepX(p, dx * PS * dt, true); }
+  }
+  if (p.climb) {
+    const dy = (keys.down ? 1 : 0) - (keys.up ? 1 : 0);
+    p.y += dy * CS * dt;
+    if (p.y <= SR[p.g]) { p.y = SR[p.g]; p.f = p.g; p.climb = false; }
+    else if (p.y >= SR[p.g + 1]) { p.y = SR[p.g + 1]; p.f = p.g + 1; p.climb = false; }
+  }
+}
+function actDig(dir) {
+  if (state !== 'play' || paused) return;
+  const p = player;
+  if (p.climb) return;
+  if (p.lock > 0) { p.q = dir; return; }   // buffer one tap so fast tapping still counts
+  const c = Math.floor(p.x), dc = c + dir, f = p.f;
+  p.dir = dir;
+  const key = f * COLS + dc, px = (dc + 0.5) * T, py = (SR[f] + 1) * T;
+  let h = holeAt(f, dc);
+  if (!h) {
+    if (!canDig(f, dc)) return;
+    h = { f, col: dc, depth: 0, vis: 0, mode: 'dig', t: 0, idle: 0, life: HOLE_LIFE, occ: null };
+    holes.set(key, h);
+  }
+  p.lock = SCOOP_TIME; h.idle = 0;
+  // an open hole, a hole already being refilled, or a hole with an alien in it gets filled; anything else gets dug
+  if (h.occ || h.mode === 'fill' || h.depth >= SCOOPS) {
+    h.mode = 'fill'; h.depth--;
+    burst(px, py, '#c9b8ff', 4);
+    if (h.depth <= 0) {
+      if (h.occ) killAlien(h.occ); else holes.delete(key);
+      sfx.fill();
+    } else sfx.dig();
+  } else {
+    p.x = c + 0.5;
+    h.depth++;
+    if (h.depth >= SCOOPS) { h.t = 0; sfx.fill(); } else sfx.dig();
+    burst(px, py, '#ff8a63', 5);
+  }
+}
+
+/* ---------- holes ---------- */
+function updHoles(dt) {
+  holes.forEach((h, key) => {
+    h.vis += (h.depth / SCOOPS - h.vis) * Math.min(1, dt * 14);
+    if (h.depth >= SCOOPS) {
+      h.t += dt;
+      if (h.t >= h.life) { if (h.occ) releaseAlien(h.occ); holes.delete(key); }
+    } else if (!h.occ) {
+      // a half-dug or half-filled hole slowly crumbles away if left alone
+      h.idle += dt;
+      if (h.idle > 1.8) { h.idle -= 0.6; h.depth--; if (h.depth <= 0) holes.delete(key); }
+    }
+  });
+}
+
+/* ---------- aliens ---------- */
+function spawnAlien(kind) {
+  const left = spawnSide++ % 2 === 0;
+  const sp = KINDS[kind].sp * (1 + 0.035 * Math.min(level - 1, 10));
+  aliens.push({ kind, sp, x: left ? 1.5 : COLS - 1.5, f: 0, y: SR[0], st: 'walk', g: 0, cdir: 0, dir: left ? 1 : -1,
+    anim: Math.random() * 3, imm: 0.8, replan: 0, plan: { x: 14.5, gap: null, cdir: 0 }, tt: 0, hole: null, ft: 0, fl: 0, f0: 0, col: 0 });
+}
+function planAlien(a) {
+  const smart = Math.random() < KINDS[a.kind].smart;
+  let want;
+  if (smart) want = playerFloor();
+  else { want = a.f + (Math.random() < 0.5 ? -1 : 1); want = Math.max(0, Math.min(GROUND, want)); }
+  if (want === a.f) { a.plan = { x: smart ? player.x : rnd(1.5, COLS - 1.5), gap: null, cdir: 0 }; return; }
+  const up = want < a.f, gap = up ? a.f - 1 : a.f;
+  let best = LAD[gap][0], bd = 1e9;
+  LAD[gap].forEach(c => { const d = Math.abs(c + 0.5 - a.x); if (d < bd) { bd = d; best = c; } });
+  a.plan = { x: best + 0.5, gap, cdir: up ? -1 : 1 };
+}
+function releaseAlien(a) {
+  a.st = 'walk'; a.imm = 1.0; a.y = SR[a.f]; a.hole = null; a.replan = 0;
+}
+function trapAlien(a, h) {
+  a.st = 'trap'; a.x = h.col + 0.5; a.hole = h; h.occ = a; a.tt = KINDS[a.kind].trap;
+  if (h.life - h.t < a.tt + 0.3) h.t = Math.max(0, h.life - a.tt - 0.3);
+  sfx.trap();
+}
+function killAlien(a) {
+  const h = a.hole;
+  if (h) { holes.delete(h.f * COLS + h.col); h.occ = null; }
+  a.st = 'fall'; a.ft = 0; a.hole = null;
+  a.f0 = a.f; a.fl = 0; a.col = Math.floor(a.x); a.x = a.col + 0.5;
+  burst(a.x * T, (a.y + 0.7) * T, '#ffd23f', 10);
+  sfx.kill();
+}
+function updAlien(a, dt) {
+  a.anim += dt;
+  if (a.imm > 0) a.imm -= dt;
+  if (a.st === 'walk') {
+    a.replan -= dt;
+    if (a.replan <= 0) { planAlien(a); a.replan = rnd(0.7, 1.6); }
+    const dx = a.plan.x - a.x;
+    if (Math.abs(dx) > 0.06) {
+      a.dir = Math.sign(dx);
+      stepX(a, a.dir * Math.min(a.sp * dt, Math.abs(dx)), false);
+    } else if (a.plan.gap !== null) {
+      a.st = 'climb'; a.g = a.plan.gap; a.cdir = a.plan.cdir; a.x = a.plan.x;
+    } else a.replan = 0;
+    if (a.imm <= 0 && a.st === 'walk') {
+      const c = Math.floor(a.x), h = openHole(a.f, c);
+      if (h && !h.occ && Math.abs(a.x - (c + 0.5)) < 0.3) trapAlien(a, h);
+    }
+  } else if (a.st === 'climb') {
+    a.y += a.cdir * a.sp * 0.9 * dt;
+    if (a.cdir < 0 && a.y <= SR[a.g]) { a.y = SR[a.g]; a.f = a.g; a.st = 'walk'; a.replan = 0; }
+    else if (a.cdir > 0 && a.y >= SR[a.g + 1]) { a.y = SR[a.g + 1]; a.f = a.g + 1; a.st = 'walk'; a.replan = 0; }
+  } else if (a.st === 'trap') {
+    a.tt -= dt;
+    if (a.tt <= 0) { const h = a.hole; if (h) h.occ = null; releaseAlien(a); }
+  } else if (a.st === 'fall') {
+    a.ft += dt;
+    const k = Math.min(1, a.ft / FALL_TIME);
+    a.y = SR[a.f] + (SR[a.f + 1] - SR[a.f]) * k * k;
+    if (a.ft >= FALL_TIME) landAlien(a);
+  }
+}
+function landAlien(a) {
+  const nf = a.f + 1;
+  a.f = nf; a.fl++; a.y = SR[nf];
+  // an open, empty hole directly underneath lets the alien keep falling
+  const below = nf < GROUND ? openHole(nf, a.col) : null;
+  if (below && !below.occ) { a.ft = 0; return; }
+  // landing on another alien destroys it
+  aliens.forEach(b => {
+    if (b !== a && (b.st === 'walk' || b.st === 'trap') && b.f === nf && Math.abs(b.x - a.x) < 0.9) {
+      if (b.hole) { holes.delete(b.hole.f * COLS + b.hole.col); b.hole = null; }
+      b.st = 'gone'; addScore(300, b.x * T, SR[nf] * T);
+      burst(b.x * T, (SR[nf] + 0.6) * T, '#ff9b2f', 12); sfx.crush();
+    }
+  });
+  if (state === 'play' && !player.climb && player.f === nf && Math.abs(player.x - a.x) < 0.7) die('crushed');
+  burst(a.x * T, (SR[nf] + 0.8) * T, '#ffffff', 8);
+  // every alien dies when it lands; falling through stacked holes earns a random bonus per extra floor
+  addScore((5 - a.f0) * 100, a.x * T, SR[nf] * T);
+  if (a.fl > 1) {
+    const bonus = (a.fl - 1) * BONUS[Math.floor(Math.random() * BONUS.length)];
+    score += bonus; if (score > hi) hi = score;
+    popups.push({ x: a.x * T, y: SR[nf] * T - 12, s: 'BONUS ' + bonus, l: 1.6 });
+    sfx.bonus();
+  }
+  a.st = 'gone'; sfx.crush();
+}
+
+/* ---------- main update ---------- */
+function update(dt) {
+  t += dt;
+  particles.forEach(p => { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 260 * dt; p.l -= dt; });
+  particles = particles.filter(p => p.l > 0);
+  popups.forEach(p => { p.y -= 18 * dt; p.l -= dt; });
+  popups = popups.filter(p => p.l > 0);
+  if (bannerT > 0) bannerT -= dt;
+
+  if (state === 'play') {
+    updPlayer(dt);
+    updHoles(dt);
+    aliens.forEach(a => updAlien(a, dt));
+    aliens = aliens.filter(a => a.st !== 'gone');
+
+    spawnT -= dt;
+    const alive = aliens.filter(a => a.st !== 'fall').length;
+    if (spawnQ.length && spawnT <= 0 && alive < Math.min(6, 2 + level)) {
+      spawnAlien(spawnQ.shift()); spawnT = Math.max(1.0, 2.4 - 0.1 * level);
+    }
+
+    for (const a of aliens) {
+      if ((a.st === 'walk' || a.st === 'climb') && Math.abs(a.x - player.x) < 0.65 && Math.abs(a.y - player.y) < 0.8) { die('caught'); break; }
+    }
+
+    if (state === 'play') {
+      const before = oxygen; oxygen -= dt;
+      if (oxygen < 10 && Math.floor(before) !== Math.floor(oxygen)) sfx.tick();
+      if (oxygen <= 0) { oxygen = 0; die('oxygen'); }
+    }
+    if (state === 'play' && !spawnQ.length && aliens.length === 0) {
+      state = 'clear'; stateT = 0; clearBonus = Math.ceil(oxygen) * 10;
+      addScore(clearBonus, W / 2, 9 * T); sfx.clear();
+    }
+  } else if (state === 'dead') {
+    stateT += dt;
+    if (stateT > 1.9) {
+      lives--;
+      if (lives <= 0) { state = 'gameover'; stateT = 0; saveHi(); } else resetRound();
+    }
+  } else if (state === 'clear') {
+    stateT += dt;
+    if (stateT > 2.6) { saveHi(); startLevel(level + 1); }
+  }
+}
+
+/* ---------- drawing ---------- */
+function txt(s, x, y, size, col, align) {
+  ctx.font = size + "px 'Press Start 2P', monospace";
+  ctx.textAlign = align || 'left'; ctx.fillStyle = col || '#e9ecff';
+  ctx.fillText(s, x, y);
+}
+function sprite(img, x, y, flip) {
+  if (flip) { ctx.save(); ctx.translate(Math.round(x) + 12, Math.round(y)); ctx.scale(-1, 1); ctx.drawImage(img, 0, 0); ctx.restore(); }
+  else ctx.drawImage(img, Math.round(x), Math.round(y));
+}
+function drawBoard() {
+  ctx.fillStyle = '#07081a'; ctx.fillRect(0, 0, W, H);
+  stars.forEach(s => {
+    ctx.fillStyle = (Math.sin(t * 1.5 + s.p) > 0.2) ? '#8f95c9' : '#3a3e80';
+    ctx.fillRect(s.x, s.y, s.s, s.s);
+  });
+  // ladders
+  for (let g = 0; g < GROUND; g++) {
+    const y0 = (SR[g] + 1) * T, y1 = (SR[g + 1] + 1) * T;
+    LAD[g].forEach(c => {
+      const x = c * T;
+      ctx.fillStyle = '#3fe0ff'; ctx.fillRect(x + 3, y0, 2, y1 - y0); ctx.fillRect(x + 11, y0, 2, y1 - y0);
+      ctx.fillStyle = '#1d93b3';
+      for (let y = y0 + 2; y < y1; y += 5) ctx.fillRect(x + 5, y, 6, 1);
+    });
+  }
+  // platforms and holes
+  for (let f = 0; f <= GROUND; f++) {
+    const y = (SR[f] + 1) * T;
+    for (let c = 0; c < COLS; c++) {
+      if (isOpening(f, c)) continue;
+      const x = c * T;
+      ctx.drawImage(f === GROUND ? GROUNDT : GIRDER, x, y);
+      const h = holeAt(f, c);
+      if (h) {
+        let frac = h.vis;
+        const full = h.depth >= SCOOPS, rem = h.life - h.t;
+        if (full && rem < 1.2) frac *= Math.max(0, rem / 1.2);
+        const hh = Math.max(0, Math.min(16, Math.round(frac * 16)));
+        ctx.fillStyle = '#07081a'; ctx.fillRect(x, y, 16, hh);
+        ctx.fillStyle = '#ffb08f'; ctx.fillRect(x, y, 1, hh); ctx.fillRect(x + 15, y, 1, hh);
+        if (full && rem < 1.2 && Math.floor(t * 10) % 2) { ctx.fillStyle = '#ff6a4a'; ctx.fillRect(x, y + hh - 1, 16, 1); }
+        // scoop marks above a partly dug or partly filled hole
+        if (!full) { ctx.fillStyle = '#ffd23f'; for (let i = 0; i < h.depth; i++) ctx.fillRect(x + 3 + i * 4, y - 2, 3, 1); }
+      }
+    }
+  }
+}
+function drawAlien(a) {
+  const k = a.kind === 'red' ? 'r' : a.kind === 'blue' ? 'b' : 'g';
+  const fr = Math.floor(a.anim * (a.st === 'trap' ? 10 : 6)) % 2 ? 'B' : 'A';
+  let px = a.x * T - 6, py = (a.y + 1) * T - 12;
+  if (a.st === 'trap') {
+    py += 8; px += Math.sin(t * 40) * (a.tt < 1 ? 1.5 : 0.6);
+    if (a.tt < 1 && Math.floor(t * 12) % 2) { ctx.globalAlpha = 0.6; }
+  }
+  sprite(SPR[k + fr], px, py, a.dir < 0);
+  ctx.globalAlpha = 1;
+}
+function drawPlayer() {
+  const p = player;
+  if (p.dead) return;
+  let img = SPR.pA, flip = p.dir < 0;
+  const px = p.x * T - 6, py = (p.y + 1) * T - 12;
+  if (p.climb) { img = SPR.pC; flip = Math.floor(p.anim * 6) % 2 === 0; }
+  else if (p.lock > 0) { img = SPR.pB; }
+  else if (keys.left !== keys.right) { img = Math.floor(p.anim * 10) % 2 ? SPR.pA : SPR.pB; }
+  else img = SPR.pB;
+  sprite(img, px, py, flip);
+  if (p.lock > 0.06) { ctx.fillStyle = '#ffb08f'; ctx.fillRect(px + (p.dir > 0 ? 12 : -3), py + 9, 3, 2); }
+}
+function drawHud() {
+  txt('SCORE', 10, 14, 8, '#8f95c9'); txt(String(score).padStart(6, '0'), 10, 28, 8, '#e9ecff');
+  txt('HIGH', W / 2, 14, 8, '#8f95c9', 'center'); txt(String(hi).padStart(6, '0'), W / 2, 28, 8, '#ffd23f', 'center');
+  txt('ROUND ' + level, W - 10, 14, 8, '#8f95c9', 'right');
+  for (let i = 0; i < Math.max(0, lives - (state === 'play' || state === 'clear' ? 1 : 0)); i++) sprite(SPR.pB, W - 22 - i * 14, 20, true);
+  // oxygen
+  const by = ROWS * T - 14, bx = 76, bw = W - bx - 10;
+  txt('OXYGEN', 10, by + 9, 8, oxygen < 10 ? '#ff6a4a' : '#8f95c9');
+  ctx.fillStyle = '#1a1d48'; ctx.fillRect(bx, by, bw, 10);
+  const fr = oxMax ? Math.max(0, oxygen / oxMax) : 0;
+  ctx.fillStyle = oxygen < 10 ? (Math.floor(t * 6) % 2 ? '#ff6a4a' : '#8f2a1c') : '#3fe0ff';
+  ctx.fillRect(bx, by, Math.round(bw * fr), 10);
+  ctx.strokeStyle = '#2a2d63'; ctx.lineWidth = 1; ctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, 9);
+}
+function panel(h) { ctx.fillStyle = 'rgba(7,8,26,0.86)'; ctx.fillRect(24, 128, W - 48, h); ctx.strokeStyle = '#2a2d63'; ctx.strokeRect(24.5, 128.5, W - 49, h - 1); }
+function drawOverlay() {
+  if (state === 'title') {
+    panel(224);
+    txt('SPACE PANIC', W / 2, 176, 24, '#ffd23f', 'center');
+    txt('DIG HOLES. TRAP ALIENS.', W / 2, 212, 8, '#e9ecff', 'center');
+    txt('HIT THEM TO DROP THEM THROUGH.', W / 2, 230, 8, '#e9ecff', 'center');
+    txt('EVERY HOLE TAKES 3 SCOOPS.', W / 2, 248, 8, '#e9ecff', 'center');
+    txt('BONUS FOR DROPS OF 2+ FLOORS.', W / 2, 266, 8, '#ffd23f', 'center');
+    if (Math.floor(t * 2) % 2) txt('PRESS ENTER OR TAP TO START', W / 2, 304, 8, '#3fe0ff', 'center');
+    txt('A FAN-MADE ARCADE TRIBUTE', W / 2, 330, 7, '#8f95c9', 'center');
+  } else if (state === 'gameover') {
+    panel(150);
+    txt('GAME OVER', W / 2, 180, 20, '#ff6a4a', 'center');
+    txt('SCORE ' + String(score).padStart(6, '0'), W / 2, 214, 8, '#e9ecff', 'center');
+    if (Math.floor(t * 2) % 2) txt('PRESS ENTER OR TAP', W / 2, 250, 8, '#3fe0ff', 'center');
+  } else if (state === 'clear') {
+    panel(110);
+    txt('ROUND CLEAR', W / 2, 172, 16, '#3fe0ff', 'center');
+    txt('OXYGEN BONUS ' + clearBonus, W / 2, 204, 8, '#ffd23f', 'center');
+  } else if (state === 'dead') {
+    txt(deathCause === 'oxygen' ? 'OUT OF OXYGEN' : deathCause === 'crushed' ? 'CRUSHED' : 'CAUGHT', W / 2, 120, 12, '#ff6a4a', 'center');
+  } else if (state === 'play' && bannerT > 0) {
+    txt('ROUND ' + level, W / 2, 120, 14, '#ffd23f', 'center');
+  }
+  if (paused) { panel(70); txt('PAUSED', W / 2, 176, 16, '#ffd23f', 'center'); }
+}
+function draw() {
+  drawBoard();
+  aliens.forEach(a => { if (a.st === 'trap') drawAlien(a); });
+  aliens.forEach(a => { if (a.st !== 'trap') drawAlien(a); });
+  if (player) drawPlayer();
+  particles.forEach(p => { ctx.fillStyle = p.c; ctx.fillRect(Math.round(p.x), Math.round(p.y), 2, 2); });
+  popups.forEach(p => txt(p.s, p.x, p.y, 8, '#ffd23f', 'center'));
+  drawHud();
+  drawOverlay();
+}
+
+/* ---------- input ---------- */
+const KEYMAP = { ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right', ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down' };
+function setMuted(m) { muted = m; document.getElementById('sound').textContent = muted ? 'Sound off' : 'Sound on'; }
+function begin() { if (state === 'title' || state === 'gameover') startGame(); }
+window.addEventListener('keydown', e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = KEYMAP[e.code];
+  if (k) { keys[k] = true; e.preventDefault(); return; }
+  if (e.repeat) { if (e.code === 'Space') e.preventDefault(); return; }
+  switch (e.code) {
+    case 'KeyZ': case 'Comma': actDig(-1); e.preventDefault(); break;
+    case 'KeyX': case 'Period': actDig(1); e.preventDefault(); break;
+    case 'Enter': case 'Space': begin(); e.preventDefault(); break;
+    case 'KeyP': case 'Escape': if (state === 'play') paused = !paused; break;
+    case 'KeyM': setMuted(!muted); break;
+  }
+});
+window.addEventListener('keyup', e => { const k = KEYMAP[e.code]; if (k) { keys[k] = false; e.preventDefault(); } });
+window.addEventListener('blur', () => { Object.keys(keys).forEach(k => { keys[k] = false; }); if (state === 'play') paused = true; });
+cv.addEventListener('pointerdown', () => { if (state === 'title' || state === 'gameover') begin(); else if (paused) paused = false; });
+document.getElementById('sound').addEventListener('click', () => setMuted(!muted));
+document.querySelectorAll('#pad button').forEach(b => {
+  const k = b.dataset.k, act = b.dataset.act;
+  b.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    if (state === 'title' || state === 'gameover') { begin(); return; }
+    if (paused) paused = false;
+    if (k) { keys[k] = true; b.classList.add('on'); }
+    else if (act === 'digL') actDig(-1); else if (act === 'digR') actDig(1);
+  });
+  const up = () => { if (k) { keys[k] = false; b.classList.remove('on'); } };
+  b.addEventListener('pointerup', up); b.addEventListener('pointerleave', up); b.addEventListener('pointercancel', up);
+  b.addEventListener('contextmenu', e => e.preventDefault());
+});
+
+/* ---------- loop ---------- */
+let last = 0;
+function frame(ts) {
+  const dt = Math.min(0.05, (ts - last) / 1000 || 0); last = ts;
+  if (!paused) update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+player = newPlayer();
+if (window.__SP_TEST) window.__SP_TEST({
+  update, startGame, startLevel, actDig, keys, holes, SR, COLS, GROUND, LAD, SRC, KINDS, spawnAlien, draw,
+  get: () => ({ state, score, lives, level, oxygen, aliens, spawnQ, player, hi }),
+  set: o => { if ('oxygen' in o) oxygen = o.oxygen; if ('state' in o) state = o.state; if ('spawnT' in o) spawnT = o.spawnT; }
+});
+else requestAnimationFrame(frame);
+})();
+</script>
+
+</body></html>
